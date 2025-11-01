@@ -405,6 +405,13 @@ def _heuristic_direction(lowered_text: str) -> str | None:
 def _heuristic_payload(text: str) -> dict[str, Any]:
     lowered = text.lower()
     intent = "create_transaction"
+    transactions_keywords = [
+        "daftar transaksi",
+        "lihat transaksi",
+        "cek transaksi",
+        "riwayat transaksi",
+        "history transaksi",
+    ]
     savings_keywords = [
         "lihat tabungan",
         "cek tabungan",
@@ -413,7 +420,9 @@ def _heuristic_payload(text: str) -> dict[str, Any]:
         "status tabungan",
         "saldo tabungan",
     ]
-    if any(keyword in lowered for keyword in savings_keywords):
+    if any(keyword in lowered for keyword in transactions_keywords):
+        intent = "list_transactions"
+    elif any(keyword in lowered for keyword in savings_keywords):
         intent = "list_savings"
     elif "tabungan" in lowered and any(word in lowered for word in ["buat", "bikin", "baru"]):
         intent = "create_saving"

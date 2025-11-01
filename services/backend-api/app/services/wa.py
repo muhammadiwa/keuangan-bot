@@ -3,6 +3,7 @@ from __future__ import annotations
 import calendar
 import json
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -152,7 +153,7 @@ async def handle_incoming_message(session: AsyncSession, payload: IncomingMessag
         elif intent == "get_balance":
             reply = await _handle_balance_request(session, user.id)
         elif intent == "list_transactions":
-            reply = _handle_transactions_placeholder()
+            reply = await _handle_transactions_request(session, user.id, payload)
         elif intent == "get_report":
             reply = await _handle_report_request(session, user.id, payload)
         else:
@@ -465,6 +466,93 @@ async def _handle_list_savings(session: AsyncSession, user_id: int) -> str:
     return "\n".join(lines)
 
 
+async def _handle_transactions_request(
+    session: AsyncSession, user_id: int, payload: IncomingMessage
+) -> str:
+    window = _determine_report_window(payload)
+    start_utc = window.start.astimezone(timezone.utc)
+    end_utc = window.end.astimezone(timezone.utc)
+
+    stmt = (
+        select(models.Transaction, models.Category.name)
+        .join(models.Category, models.Transaction.category_id == models.Category.id, isouter=True)
+        .where(
+            models.Transaction.user_id == user_id,
+            models.Transaction.tx_datetime >= start_utc,
+            models.Transaction.tx_datetime <= end_utc,
+        )
+        .order_by(models.Transaction.tx_datetime.desc())
+    )
+
+    result = await session.execute(stmt)
+    rows = result.all()
+    if not rows:
+        return (
+            f"📒 *Daftar Transaksi — {window.title}*\n"
+            f"🗓️ {window.period_label}\n"
+            "Belum ada transaksi pada periode ini."
+        )
+
+    tz = ZoneInfo(settings.timezone)
+    grouped: dict[datetime.date, list[tuple[datetime, models.Transaction, str | None]]] = defaultdict(list)
+    order: list[datetime.date] = []
+    total_income = 0.0
+    total_expense = 0.0
+    income_count = 0
+    expense_count = 0
+
+    for tx, category_name in rows:
+        local_dt = tx.tx_datetime.astimezone(tz)
+        date_key = local_dt.date()
+        if date_key not in grouped:
+            order.append(date_key)
+        grouped[date_key].append((local_dt, tx, category_name))
+
+        amount_float = float(tx.amount)
+        if tx.direction == "income":
+            total_income += amount_float
+            income_count += 1
+        elif tx.direction == "expense":
+            total_expense += amount_float
+            expense_count += 1
+
+    lines = [
+        f"📒 *Daftar Transaksi — {window.title}*",
+        f"🗓️ {window.period_label}",
+        "",
+    ]
+
+    for date_key in order:
+        date_label = date_key.strftime("%A, %d %b %Y")
+        lines.append(f"📆 {date_label}")
+        for local_dt, tx, category_name in grouped[date_key]:
+            time_label = local_dt.strftime("%H:%M")
+            amount_fmt = _format_currency(float(tx.amount), tx.currency)
+            direction_icon = "📤" if tx.direction == "expense" else "📥"
+            description = tx.description or "(tanpa deskripsi)"
+            category_label = category_name or "Tanpa kategori"
+            lines.append(
+                f"  • [{time_label}] {direction_icon} {amount_fmt} — {description} ({category_label})"
+            )
+        lines.append("")
+
+    balance = total_income - total_expense
+    balance_icon = "💰" if balance >= 0 else "⚠️"
+    lines.append(
+        f"📥 Total Pemasukan: {_format_currency(total_income, 'IDR')} ({income_count} transaksi)"
+    )
+    lines.append(
+        f"📤 Total Pengeluaran: {_format_currency(total_expense, 'IDR')} ({expense_count} transaksi)"
+    )
+    lines.append(f"{balance_icon} Saldo Bersih: {_format_currency(balance, 'IDR')}")
+    lines.append("")
+    lines.append(
+        "💡 Gunakan 'daftar transaksi minggu ini' atau 'daftar transaksi bulan lalu' untuk periode lain."
+    )
+
+    return "\n".join(lines)
+
+
 async def _handle_balance_request(session: AsyncSession, user_id: int) -> str:
     income_stmt = select(func.coalesce(func.sum(models.Transaction.amount), 0)).where(
         models.Transaction.user_id == user_id,
@@ -500,13 +588,6 @@ async def _handle_balance_request(session: AsyncSession, user_id: int) -> str:
         "💡 Kamu bisa minta 'laporan bulan ini' atau 'lihat tabungan' untuk detail lainnya.",
     ]
     return "\n".join(lines)
-
-
-def _handle_transactions_placeholder() -> str:
-    return (
-        "Fitur daftar transaksi detail belum tersedia. Untuk saat ini, gunakan "
-        "perintah laporan (mis. 'laporan hari ini' atau 'laporan bulan ini') untuk ringkasan transaksi."
-    )
 
 
 async def _handle_report_request(
