@@ -100,7 +100,21 @@ app.post('/webhook/test', async (req, res) => {
 
 const forwardToBackend = async (payload) => {
   try {
-    await axios.post(`${BACKEND_API_URL}/wa/incoming`, payload, { timeout: 10000 });
+    const { data } = await axios.post(`${BACKEND_API_URL}/wa/incoming`, payload, { timeout: 10000 });
+    const reply = data?.reply;
+    if (reply) {
+      const sessionEntry = sessions.get(SESSION_ID);
+      if (!sessionEntry?.socket) {
+        logger.warn({ sessionId: SESSION_ID }, 'Cannot send reply, session not ready');
+        return;
+      }
+      try {
+        await sessionEntry.socket.sendMessage(`${payload.from_number}@s.whatsapp.net`, { text: reply });
+        logger.info({ to: payload.from_number }, 'Delivered reply from backend');
+      } catch (sendError) {
+        logger.error({ err: sendError, to: payload.from_number }, 'Failed sending reply to WhatsApp');
+      }
+    }
   } catch (error) {
     logger.error({ err: error, payload }, 'Failed forwarding to backend');
   }

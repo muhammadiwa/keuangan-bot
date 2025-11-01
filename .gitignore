@@ -12,4 +12,5 @@ services/ai-media-service/.env
 .vscode/
 .DS_Store
 .data/
-
+data/
+services/wa-bot-service/sessions/

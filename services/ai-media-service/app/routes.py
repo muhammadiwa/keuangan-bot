@@ -44,6 +44,7 @@ class ParseResponse(BaseModel):
     category_suggestion: str | None = None
     datetime: str | None = None
     confidence: float | None = None
+    direction: str | None = None
 
 
 class MediaUrlRequest(BaseModel):
@@ -143,6 +144,264 @@ def _extract_json_payload(response_text: str) -> dict[str, Any]:
     return payload
 
 
+_AMOUNT_SUFFIX_MULTIPLIERS = {
+    "rb": 1000,
+    "ribu": 1000,
+    "k": 1000,
+    "jt": 1_000_000,
+    "juta": 1_000_000,
+    "m": 1_000_000_000,
+    "miliar": 1_000_000_000,
+    "milyar": 1_000_000_000,
+    "ratus": 100,
+    "ratusan": 100,
+}
+
+_AMOUNT_PATTERN = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*(rb|ribu|k|jt|juta|m|miliar|milyar|ratus|ratusan)?",
+    re.IGNORECASE,
+)
+
+_CATEGORY_KEYWORDS = {
+    "Makan": [
+        "makan",
+        "sarapan",
+        "lunch",
+        "dinner",
+        "kuliner",
+        "resto",
+        "restaurant",
+        "warteg",
+        "kopi",
+        "coffee",
+        "cafe",
+        "kuliner",
+        "ayam geprek",
+        "nasi",
+        "bakso",
+    ],
+    "Transport": [
+        "transport",
+        "bensin",
+        "bbm",
+        "tol",
+        "parkir",
+        "grab",
+        "gojek",
+        "go ride",
+        "go car",
+        "ojek",
+        "angkot",
+        "kereta",
+        "bus",
+        "taxi",
+        "ongkir",
+        "ongkos kirim",
+    ],
+    "Belanja": [
+        "belanja",
+        "beli",
+        "shopping",
+        "mall",
+        "baju",
+        "celana",
+        "sepatu",
+        "fashion",
+        "thrift",
+        "makeup",
+        "skincare",
+        "kosmetik",
+    ],
+    "Kesehatan": [
+        "dokter",
+        "rumah sakit",
+        "klinik",
+        "obat",
+        "vitamin",
+        "apotek",
+        "bpjs",
+        "medical",
+    ],
+    "Hiburan": [
+        "hiburan",
+        "bioskop",
+        "nonton",
+        "game",
+        "steam",
+        "spotify",
+        "netflix",
+        "viu",
+        "disney",
+        "langganan",
+        "subscrib",
+    ],
+    "Tagihan": [
+        "listrik",
+        "token",
+        "pln",
+        "pdam",
+        "air",
+        "internet",
+        "wifi",
+        "indihome",
+        "telkomsel",
+        "pulsa",
+        "paket data",
+        "bayar tagihan",
+        "cicilan",
+        "angsuran",
+    ],
+    "Pendidikan": [
+        "kuliah",
+        "kampus",
+        "sekolah",
+        "pendidikan",
+        "buku",
+        "kursus",
+        "les",
+        "bimbel",
+    ],
+    "Investasi": [
+        "investasi",
+        "saham",
+        "reksa dana",
+        "crypto",
+        "emas",
+        "bitcoin",
+    ],
+    "Gaji": [
+        "gaji",
+        "salary",
+        "bayaran",
+        "pendapatan",
+        "dibayar",
+        "transfer gaji",
+        "bonus",
+        "thr",
+        "honor",
+    ],
+    "Penjualan": [
+        "jual",
+        "penjualan",
+        "invoice",
+        "customer",
+        "klien",
+        "order",
+        "pesanan",
+        "omzet",
+    ],
+    "Hadiah": [
+        "hadiah",
+        "gift",
+        "kado",
+        "angpao",
+        "uang saku",
+    ],
+}
+
+_CATEGORY_PRIORITY = [
+    "Gaji",
+    "Penjualan",
+    "Hadiah",
+    "Investasi",
+    "Tagihan",
+    "Makan",
+    "Belanja",
+    "Transport",
+    "Kesehatan",
+    "Hiburan",
+    "Pendidikan",
+]
+
+_INCOME_CATEGORIES = {"Gaji", "Penjualan", "Hadiah", "Investasi"}
+
+_INCOME_KEYWORDS = [
+    "gaji",
+    "terima",
+    "masuk",
+    "bonus",
+    "bayaran",
+    "pendapatan",
+    "penjualan",
+    "invoice",
+    "customer",
+    "klien",
+    "transfer masuk",
+    "omzet",
+    "dapat",
+    "thr",
+    "honor",
+]
+
+_TRANSFER_KEYWORDS = [
+    "transfer",
+    "kirim",
+    "pindah",
+    "mutasi",
+]
+
+_EXPENSE_KEYWORDS = [
+    "bayar",
+    "beli",
+    "belanja",
+    "habis",
+    "keluar",
+    "biaya",
+    "ongkir",
+    "ongkos",
+    "tagihan",
+]
+
+
+def _extract_amount_indonesia(text: str) -> float | None:
+    candidates: list[tuple[int, float]] = []
+    for match in _AMOUNT_PATTERN.finditer(text.lower()):
+        number_part, suffix = match.groups()
+        if not number_part:
+            continue
+        normalized = number_part.replace(".", "").replace(",", ".")
+        try:
+            base_value = float(normalized)
+        except ValueError:
+            continue
+        multiplier = 1.0
+        priority = 0
+        if suffix:
+            suffix_key = suffix.lower()
+            multiplier = float(_AMOUNT_SUFFIX_MULTIPLIERS.get(suffix_key, 1))
+            priority = 1
+        amount = base_value * multiplier
+        candidates.append((priority, amount))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (-item[0], -item[1]))
+    return candidates[0][1]
+
+
+def _suggest_category(lowered_text: str) -> str | None:
+    for category in _CATEGORY_PRIORITY:
+        keywords = _CATEGORY_KEYWORDS.get(category, [])
+        if any(keyword in lowered_text for keyword in keywords):
+            return category
+
+    for category, keywords in _CATEGORY_KEYWORDS.items():
+        if any(keyword in lowered_text for keyword in keywords):
+            return category
+    return None
+
+
+def _heuristic_direction(lowered_text: str) -> str | None:
+    if any(word in lowered_text for word in _INCOME_KEYWORDS):
+        return "income"
+    if any(word in lowered_text for word in _TRANSFER_KEYWORDS):
+        return "transfer"
+    if any(word in lowered_text for word in _EXPENSE_KEYWORDS):
+        return "expense"
+    return None
+
+
 def _heuristic_payload(text: str) -> dict[str, Any]:
     lowered = text.lower()
     intent = "create_transaction"
@@ -155,13 +414,17 @@ def _heuristic_payload(text: str) -> dict[str, Any]:
     elif "laporan" in lowered:
         intent = "get_report"
 
-    amount_match = re.search(r"([0-9]+[.,0-9]*)", text)
-    amount = float(amount_match.group(1).replace(".", "").replace(",", ".")) if amount_match else None
-    category = None
-    if "makan" in lowered:
-        category = "Makan"
-    elif "transport" in lowered or "bensin" in lowered:
-        category = "Transport"
+    amount = _extract_amount_indonesia(text)
+    if amount is None:
+        amount_match = re.search(r"([0-9]+[.,0-9]*)", text)
+        if amount_match:
+            amount = float(amount_match.group(1).replace(".", "").replace(",", "."))
+
+    category = _suggest_category(lowered)
+    direction = _heuristic_direction(lowered)
+
+    if direction is None and category in _INCOME_CATEGORIES:
+        direction = "income"
 
     return {
         "intent": intent,
@@ -169,6 +432,7 @@ def _heuristic_payload(text: str) -> dict[str, Any]:
         "currency": "IDR",
         "description": text.strip(),
         "category_suggestion": category,
+        "direction": direction,
         "datetime": datetime.utcnow().isoformat(),
         "confidence": 0.4,
     }
