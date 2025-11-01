@@ -111,6 +111,18 @@ async def handle_incoming_message(session: AsyncSession, payload: IncomingMessag
             parsed.category_suggestion = None
             parsed.amount = None
             parsed.direction = None
+        if _text_requests_balance(text_content):
+            parsed.intent = "get_balance"
+            parsed.description = None
+            parsed.category_suggestion = None
+            parsed.amount = None
+            parsed.direction = None
+        if _text_requests_transactions_list(text_content):
+            parsed.intent = "list_transactions"
+            parsed.description = None
+            parsed.category_suggestion = None
+            parsed.amount = None
+            parsed.direction = None
         if (
             parsed.intent == "create_transaction"
             and parsed.amount is None
@@ -137,6 +149,10 @@ async def handle_incoming_message(session: AsyncSession, payload: IncomingMessag
             reply = await _handle_savings_movement(session, user.id, parsed)
         elif intent == "list_savings":
             reply = await _handle_list_savings(session, user.id)
+        elif intent == "get_balance":
+            reply = await _handle_balance_request(session, user.id)
+        elif intent == "list_transactions":
+            reply = _handle_transactions_placeholder()
         elif intent == "get_report":
             reply = await _handle_report_request(session, user.id, payload)
         else:
@@ -248,6 +264,11 @@ async def _handle_transaction_intent(
     parsed: ParsedIntent,
     raw_text: str,
 ) -> str:
+    if parsed.amount is None and not _message_looks_like_transaction(raw_text):
+        return (
+            "Sepertinya itu bukan catatan transaksi. Coba jelaskan seperti \"beli kopi 20rb\" atau \"terima gaji 5jt\" ya."
+        )
+
     if parsed.amount is None:
         return "Hmm, aku belum menangkap nominalnya. Bisa sebutkan jumlahnya supaya aku bantu catat ya?"
 
@@ -442,6 +463,50 @@ async def _handle_list_savings(session: AsyncSession, user_id: int) -> str:
 
     lines.append("💡 Gunakan \"Setor <nominal> ke tabungan <nama>\" atau \"Tarik ...\" untuk memperbarui.")
     return "\n".join(lines)
+
+
+async def _handle_balance_request(session: AsyncSession, user_id: int) -> str:
+    income_stmt = select(func.coalesce(func.sum(models.Transaction.amount), 0)).where(
+        models.Transaction.user_id == user_id,
+        models.Transaction.direction == "income",
+    )
+    expense_stmt = select(func.coalesce(func.sum(models.Transaction.amount), 0)).where(
+        models.Transaction.user_id == user_id,
+        models.Transaction.direction == "expense",
+    )
+    income_count_stmt = select(func.count(models.Transaction.id)).where(
+        models.Transaction.user_id == user_id,
+        models.Transaction.direction == "income",
+    )
+    expense_count_stmt = select(func.count(models.Transaction.id)).where(
+        models.Transaction.user_id == user_id,
+        models.Transaction.direction == "expense",
+    )
+
+    income_total = (await session.execute(income_stmt)).scalar() or 0
+    expense_total = (await session.execute(expense_stmt)).scalar() or 0
+    income_count = (await session.execute(income_count_stmt)).scalar() or 0
+    expense_count = (await session.execute(expense_count_stmt)).scalar() or 0
+
+    balance = float(income_total) - float(expense_total)
+    balance_icon = "💰" if balance >= 0 else "⚠️"
+
+    lines = [
+        "💼 *Saldo Saat Ini*",
+        f"📥 Pemasukan: {_format_currency(income_total, 'IDR')} ({income_count} transaksi)",
+        f"📤 Pengeluaran: {_format_currency(expense_total, 'IDR')} ({expense_count} transaksi)",
+        f"{balance_icon} Saldo Bersih: {_format_currency(balance, 'IDR')}",
+        "",
+        "💡 Kamu bisa minta 'laporan bulan ini' atau 'lihat tabungan' untuk detail lainnya.",
+    ]
+    return "\n".join(lines)
+
+
+def _handle_transactions_placeholder() -> str:
+    return (
+        "Fitur daftar transaksi detail belum tersedia. Untuk saat ini, gunakan "
+        "perintah laporan (mis. 'laporan hari ini' atau 'laporan bulan ini') untuk ringkasan transaksi."
+    )
 
 
 async def _handle_report_request(
@@ -749,6 +814,35 @@ def _text_requests_savings_list(text: str | None) -> bool:
     return any(keyword in lowered for keyword in keywords)
 
 
+def _text_requests_balance(text: str | None) -> bool:
+    if not text:
+        return False
+    lowered = text.lower().strip()
+    keywords = [
+        "saldo",
+        "cek saldo",
+        "lihat saldo",
+        "sisa uang",
+        "balance",
+        "total uang",
+    ]
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _text_requests_transactions_list(text: str | None) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    keywords = [
+        "daftar transaksi",
+        "lihat transaksi",
+        "riwayat transaksi",
+        "history transaksi",
+        "cek transaksi",
+    ]
+    return any(keyword in lowered for keyword in keywords)
+
+
 def _normalize_saving_name(raw: str) -> str:
     candidate = (raw or "").strip()
     candidate = re.sub(r"\s+", " ", candidate)
@@ -814,6 +908,34 @@ def _extract_saving_reference(text: str | None) -> str | None:
     return None
 
 
+def _message_looks_like_transaction(text: str | None) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    if re.search(r"\d", text):
+        return True
+    transaction_keywords = [
+        "beli",
+        "bayar",
+        "belanja",
+        "makan",
+        "ongkir",
+        "tagihan",
+        "top up",
+        "transfer",
+        "gaji",
+        "terima",
+        "masuk",
+        "setor",
+        "tarik",
+        "deposit",
+        "withdraw",
+        "pemasukan",
+        "pengeluaran",
+    ]
+    return any(keyword in lowered for keyword in transaction_keywords)
+
+
 def _set_pending_action(*, user_id: int, action_type: str, data: dict[str, Any]) -> None:
     expires = datetime.now(timezone.utc) + timedelta(minutes=5)
     _pending_actions[user_id] = PendingAction(action_type=action_type, data=data, expires_at=expires)
@@ -863,7 +985,7 @@ async def _maybe_handle_pending_action(
             intent="smalltalk",
         )
 
-    if _text_requests_savings_list(text):
+    if _text_requests_savings_list(text) or _text_requests_balance(text) or _text_requests_transactions_list(text):
         _clear_pending_action(user_id)
         return None
 
