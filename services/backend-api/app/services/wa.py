@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from loguru import logger
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -118,6 +118,18 @@ async def handle_incoming_message(session: AsyncSession, payload: IncomingMessag
             parsed.category_suggestion = None
             parsed.amount = None
             parsed.direction = None
+        if _text_requests_category_list(text_content):
+            parsed.intent = "list_categories"
+            parsed.description = None
+            parsed.category_suggestion = None
+            parsed.amount = None
+            parsed.direction = None
+        if _text_requests_category_add(text_content):
+            parsed.intent = "add_category"
+        if _text_requests_category_delete(text_content):
+            parsed.intent = "delete_category"
+        if _text_requests_category_rename(text_content):
+            parsed.intent = "rename_category"
         if _text_requests_transactions_list(text_content):
             parsed.intent = "list_transactions"
             parsed.description = None
@@ -137,6 +149,17 @@ async def handle_incoming_message(session: AsyncSession, payload: IncomingMessag
             reference = _extract_saving_reference(text_content)
             if reference:
                 parsed.description = reference
+        if parsed.intent in {"add_category", "delete_category", "rename_category"}:
+            map_action = {
+                "add_category": "add",
+                "delete_category": "delete",
+                "rename_category": "rename",
+            }
+            first, second = _extract_category_names(text_content, map_action[parsed.intent])
+            if parsed.intent in {"add_category", "delete_category"} and first:
+                parsed.description = first
+            elif parsed.intent == "rename_category" and first and second:
+                parsed.description = f"{first}|{second}"
 
         reply: str
         intent = parsed.intent
@@ -152,6 +175,14 @@ async def handle_incoming_message(session: AsyncSession, payload: IncomingMessag
             reply = await _handle_list_savings(session, user.id)
         elif intent == "get_balance":
             reply = await _handle_balance_request(session, user.id)
+        elif intent == "list_categories":
+            reply = await _handle_list_categories(session, user.id)
+        elif intent == "add_category":
+            reply = await _handle_add_category(session, user.id, text_content)
+        elif intent == "rename_category":
+            reply = await _handle_rename_category(session, user.id, text_content)
+        elif intent == "delete_category":
+            reply = await _handle_delete_category(session, user.id, text_content)
         elif intent == "list_transactions":
             reply = await _handle_transactions_request(session, user.id, payload)
         elif intent == "get_report":
@@ -466,10 +497,159 @@ async def _handle_list_savings(session: AsyncSession, user_id: int) -> str:
     return "\n".join(lines)
 
 
+async def _handle_list_categories(session: AsyncSession, user_id: int) -> str:
+    stmt = (
+        select(
+            models.Category,
+            func.count(models.Transaction.id),
+            func.coalesce(
+                func.sum(
+                    case((models.Transaction.direction == "income", models.Transaction.amount), else_=0)
+                ),
+                0,
+            ),
+            func.coalesce(
+                func.sum(
+                    case((models.Transaction.direction == "expense", models.Transaction.amount), else_=0)
+                ),
+                0,
+            ),
+        )
+        .join(models.Transaction, models.Transaction.category_id == models.Category.id, isouter=True)
+        .where(models.Category.user_id == user_id)
+        .group_by(models.Category.id)
+        .order_by(models.Category.name.asc())
+    )
+    result = await session.execute(stmt)
+    rows = result.all()
+
+    if not rows:
+        return (
+            "Belum ada kategori khusus. Coba tambah dengan mengetik "
+            "\"tambah kategori <nama>\"."
+        )
+
+    lines = ["🏷️ *Kategori Aktif*"]
+    total_income = 0.0
+    total_expense = 0.0
+
+    for idx, (category, tx_count, income_sum, expense_sum) in enumerate(rows, start=1):
+        total_income += float(income_sum or 0)
+        total_expense += float(expense_sum or 0)
+        lines.append(f"{idx}. {category.name}")
+        lines.append(f"   • Transaksi: {tx_count}")
+        if income_sum:
+            lines.append(
+                f"   • Pemasukan: {_format_currency(float(income_sum), 'IDR')}"
+            )
+        if expense_sum:
+            lines.append(
+                f"   • Pengeluaran: {_format_currency(float(expense_sum), 'IDR')}"
+            )
+        lines.append("")
+
+    balance = total_income - total_expense
+    balance_icon = "💰" if balance >= 0 else "⚠️"
+    lines.append(
+        f"📥 Total Pemasukan: {_format_currency(total_income, 'IDR')}"
+    )
+    lines.append(
+        f"📤 Total Pengeluaran: {_format_currency(total_expense, 'IDR')}"
+    )
+    lines.append(f"{balance_icon} Saldo Bersih: {_format_currency(balance, 'IDR')}")
+    lines.append("")
+    lines.append(
+        "💡 Contoh perintah: 'tambah kategori Transport', 'ubah kategori Jajan menjadi Hiburan', atau 'hapus kategori Belanja'."
+    )
+
+    return "\n".join(lines)
+
+
+async def _handle_add_category(session: AsyncSession, user_id: int, text: str | None) -> str:
+    name, _ = _extract_category_names(text, "add")
+    if not name:
+        return "Sebutkan nama kategori yang ingin dibuat, misalnya 'tambah kategori Transport'."
+
+    existing = await _find_category_by_name(session, user_id, name)
+    if existing:
+        return f"Kategori \"{existing.name}\" sudah ada."
+
+    category = models.Category(user_id=user_id, name=name)
+    session.add(category)
+    await session.commit()
+    return f"✅ Kategori \"{name}\" berhasil ditambahkan."
+
+
+async def _handle_rename_category(session: AsyncSession, user_id: int, text: str | None) -> str:
+    old_name, new_name = _extract_category_names(text, "rename")
+    if not old_name or not new_name:
+        return "Gunakan format 'ubah kategori Lama menjadi Baru'."
+
+    category = await _find_category_by_name(session, user_id, old_name)
+    if not category:
+        hint = await _format_categories_hint(session, user_id)
+        return f"Kategori \"{old_name}\" tidak ditemukan.{hint}"
+
+    duplicate = await _find_category_by_name(session, user_id, new_name)
+    if duplicate and duplicate.id != category.id:
+        return f"Kategori \"{new_name}\" sudah tersedia."
+
+    category.name = new_name
+    await session.commit()
+    return f"✅ Kategori \"{old_name}\" diganti menjadi \"{new_name}\"."
+
+
+async def _handle_delete_category(session: AsyncSession, user_id: int, text: str | None) -> str:
+    name, _ = _extract_category_names(text, "delete")
+    if not name:
+        return "Sebutkan kategori yang ingin dihapus, contohnya 'hapus kategori Transport'."
+
+    category = await _find_category_by_name(session, user_id, name)
+    if not category:
+        hint = await _format_categories_hint(session, user_id)
+        return f"Kategori \"{name}\" tidak ditemukan.{hint}"
+
+    await session.delete(category)
+    await session.commit()
+    return f"✅ Kategori \"{name}\" berhasil dihapus. Semua transaksi terkait kini tanpa kategori."
+
+
 async def _handle_transactions_request(
     session: AsyncSession, user_id: int, payload: IncomingMessage
 ) -> str:
     window = _determine_report_window(payload)
+    text_lower = (payload.text or "").lower()
+    if "transaksi" in text_lower:
+        specific_keywords = [
+            "hari",
+            "minggu",
+            "tahun",
+            "kemarin",
+            "lalu",
+            "bulan",
+            "tanggal",
+            "/",
+            "-",
+        ]
+        if window.title == "Hari Ini" and not any(keyword in text_lower for keyword in specific_keywords):
+            tz = ZoneInfo(settings.timezone)
+            base = (payload.timestamp or datetime.now(timezone.utc)).astimezone(tz)
+            start_local = base.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            last_day = calendar.monthrange(base.year, base.month)[1]
+            end_local = base.replace(
+                day=last_day,
+                hour=23,
+                minute=59,
+                second=59,
+                microsecond=999999,
+            )
+            window = ReportWindow(
+                title="Bulan Ini",
+                start=start_local,
+                end=end_local,
+                period_label=_format_period(start_local, end_local, tz),
+            )
+
     start_utc = window.start.astimezone(timezone.utc)
     end_utc = window.end.astimezone(timezone.utc)
 
@@ -840,6 +1020,38 @@ async def _format_savings_hint(session: AsyncSession, user_id: int) -> str:
     return f" Coba gunakan salah satu nama ini: {preview}."
 
 
+async def _get_categories(session: AsyncSession, user_id: int) -> list[models.Category]:
+    stmt = (
+        select(models.Category)
+        .where(models.Category.user_id == user_id)
+        .order_by(models.Category.name.asc())
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+async def _find_category_by_name(
+    session: AsyncSession, user_id: int, name: str
+) -> models.Category | None:
+    normalized = _normalize_category_name(name).lower()
+    stmt = select(models.Category).where(
+        models.Category.user_id == user_id,
+        func.lower(models.Category.name) == normalized,
+    )
+    return await session.scalar(stmt)
+
+
+async def _format_categories_hint(session: AsyncSession, user_id: int) -> str:
+    categories = await _get_categories(session, user_id)
+    if not categories:
+        return ""
+    names = [category.name for category in categories[:5]]
+    preview = ", ".join(names)
+    if len(categories) > 5:
+        preview += ", ..."
+    return f" Coba gunakan salah satu nama kategori: {preview}."
+
+
 def _looks_like_amount_only(text: str | None) -> bool:
     if not text:
         return False
@@ -924,6 +1136,54 @@ def _text_requests_transactions_list(text: str | None) -> bool:
     return any(keyword in lowered for keyword in keywords)
 
 
+def _text_requests_category_list(text: str | None) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    keywords = [
+        "daftar kategori",
+        "lihat kategori",
+        "cek kategori",
+    ]
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _text_requests_category_add(text: str | None) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    keywords = [
+        "tambah kategori",
+        "kategori baru",
+        "buat kategori",
+    ]
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _text_requests_category_delete(text: str | None) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    keywords = [
+        "hapus kategori",
+        "delete kategori",
+        "remove kategori",
+    ]
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _text_requests_category_rename(text: str | None) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    keywords = [
+        "ubah kategori",
+        "rename kategori",
+        "ganti kategori",
+    ]
+    return any(keyword in lowered for keyword in keywords)
+
+
 def _normalize_saving_name(raw: str) -> str:
     candidate = (raw or "").strip()
     candidate = re.sub(r"\s+", " ", candidate)
@@ -989,10 +1249,81 @@ def _extract_saving_reference(text: str | None) -> str | None:
     return None
 
 
+def _normalize_category_name(raw: str) -> str:
+    candidate = (raw or "").strip()
+    candidate = re.sub(r"\s+", " ", candidate)
+    candidate = re.sub(r"[\"'`]+", "", candidate)
+    if not candidate:
+        return "Umum"
+
+    tokens = candidate.split()
+    if tokens and tokens[0].lower() == "kategori":
+        tokens = tokens[1:]
+    name = " ".join(tokens).strip()
+    if not name:
+        name = candidate
+    return name.title()
+
+
+def _extract_category_names(text: str | None, action: str) -> tuple[str | None, str | None]:
+    if not text:
+        return None, None
+
+    original = text.strip()
+
+    def slice_after(keyword: str) -> str | None:
+        lowered = original.lower()
+        idx = lowered.find(keyword)
+        if idx == -1:
+            return None
+        value = original[idx + len(keyword):].strip(" :")
+        return value or None
+
+    if action == "add":
+        for keyword in ["tambah kategori", "kategori baru", "buat kategori"]:
+            name = slice_after(keyword)
+            if name:
+                return _normalize_category_name(name), None
+        return None, None
+
+    if action == "delete":
+        for keyword in ["hapus kategori", "delete kategori", "remove kategori"]:
+            name = slice_after(keyword)
+            if name:
+                return _normalize_category_name(name), None
+        return None, None
+
+    if action == "rename":
+        patterns = [
+            r"ubah\s+kategori\s+(.+?)\s+(?:menjadi|ke)\s+(.+)",
+            r"ganti\s+kategori\s+(.+?)\s+(?:menjadi|ke)\s+(.+)",
+            r"rename\s+kategori\s+(.+?)\s+(?:menjadi|ke)\s+(.+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, original, flags=re.IGNORECASE)
+            if match:
+                old_name = _normalize_category_name(match.group(1))
+                new_name = _normalize_category_name(match.group(2))
+                return old_name, new_name
+        return None, None
+
+    return None, None
+
+
 def _message_looks_like_transaction(text: str | None) -> bool:
     if not text:
         return False
     lowered = text.lower()
+    if (
+        _text_requests_savings_list(text)
+        or _text_requests_balance(text)
+        or _text_requests_transactions_list(text)
+        or _text_requests_category_list(text)
+        or _text_requests_category_add(text)
+        or _text_requests_category_delete(text)
+        or _text_requests_category_rename(text)
+    ):
+        return False
     if re.search(r"\d", text):
         return True
     transaction_keywords = [
@@ -1066,7 +1397,15 @@ async def _maybe_handle_pending_action(
             intent="smalltalk",
         )
 
-    if _text_requests_savings_list(text) or _text_requests_balance(text) or _text_requests_transactions_list(text):
+    if (
+        _text_requests_savings_list(text)
+        or _text_requests_balance(text)
+        or _text_requests_transactions_list(text)
+        or _text_requests_category_list(text)
+        or _text_requests_category_add(text)
+        or _text_requests_category_delete(text)
+        or _text_requests_category_rename(text)
+    ):
         _clear_pending_action(user_id)
         return None
 
@@ -1279,6 +1618,13 @@ async def _call_ai_service(endpoint: str, payload: dict[str, object]) -> dict[st
 def _heuristic_parse(text: str) -> ParsedIntent:
     lowered = text.lower()
     intent = "create_transaction"
+    transactions_keywords = [
+        "daftar transaksi",
+        "lihat transaksi",
+        "cek transaksi",
+        "riwayat transaksi",
+        "history transaksi",
+    ]
     savings_list_keywords = [
         "lihat tabungan",
         "cek tabungan",
@@ -1287,8 +1633,38 @@ def _heuristic_parse(text: str) -> ParsedIntent:
         "status tabungan",
         "saldo tabungan",
     ]
-    if any(keyword in lowered for keyword in savings_list_keywords):
+    category_list_keywords = [
+        "daftar kategori",
+        "lihat kategori",
+        "cek kategori",
+    ]
+    category_add_keywords = [
+        "tambah kategori",
+        "kategori baru",
+        "buat kategori",
+    ]
+    category_delete_keywords = [
+        "hapus kategori",
+        "delete kategori",
+        "remove kategori",
+    ]
+    category_rename_keywords = [
+        "ubah kategori",
+        "rename kategori",
+        "ganti kategori",
+    ]
+    if any(keyword in lowered for keyword in transactions_keywords):
+        intent = "list_transactions"
+    elif any(keyword in lowered for keyword in savings_list_keywords):
         intent = "list_savings"
+    elif any(keyword in lowered for keyword in category_list_keywords):
+        intent = "list_categories"
+    elif any(keyword in lowered for keyword in category_add_keywords):
+        intent = "add_category"
+    elif any(keyword in lowered for keyword in category_delete_keywords):
+        intent = "delete_category"
+    elif any(keyword in lowered for keyword in category_rename_keywords):
+        intent = "rename_category"
     elif any(word in lowered for word in ["buat tabungan", "nabung", "tabungan"]):
         intent = "create_saving"
     if any(word in lowered for word in ["setor", "deposit"]):
@@ -1298,8 +1674,8 @@ def _heuristic_parse(text: str) -> ParsedIntent:
     if "laporan" in lowered:
         intent = "get_report"
 
-    if intent == "list_savings":
-        return ParsedIntent(intent="list_savings", amount=None, description=None, category_suggestion=None, direction=None)
+    if intent in {"list_savings", "list_transactions", "list_categories"}:
+        return ParsedIntent(intent=intent, amount=None, description=None, category_suggestion=None, direction=None)
 
     amount = _extract_amount_indonesia(text)
     if amount is None:
@@ -1316,6 +1692,17 @@ def _heuristic_parse(text: str) -> ParsedIntent:
         reference = _extract_saving_reference(text)
         if reference:
             description = reference
+    if intent in {"add_category", "delete_category", "rename_category"}:
+        map_action = {
+            "add_category": "add",
+            "delete_category": "delete",
+            "rename_category": "rename",
+        }
+        name1, name2 = _extract_category_names(text, map_action[intent])
+        if intent in {"add_category", "delete_category"} and name1:
+            description = name1
+        elif intent == "rename_category" and name1 and name2:
+            description = f"{name1}|{name2}"
 
     return ParsedIntent(
         intent=intent,

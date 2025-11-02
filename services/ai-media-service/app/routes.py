@@ -420,10 +420,38 @@ def _heuristic_payload(text: str) -> dict[str, Any]:
         "status tabungan",
         "saldo tabungan",
     ]
+    category_list_keywords = [
+        "daftar kategori",
+        "lihat kategori",
+        "cek kategori",
+    ]
+    category_add_keywords = [
+        "tambah kategori",
+        "kategori baru",
+        "buat kategori",
+    ]
+    category_delete_keywords = [
+        "hapus kategori",
+        "delete kategori",
+        "remove kategori",
+    ]
+    category_rename_keywords = [
+        "ubah kategori",
+        "rename kategori",
+        "ganti kategori",
+    ]
     if any(keyword in lowered for keyword in transactions_keywords):
         intent = "list_transactions"
     elif any(keyword in lowered for keyword in savings_keywords):
         intent = "list_savings"
+    elif any(keyword in lowered for keyword in category_list_keywords):
+        intent = "list_categories"
+    elif any(keyword in lowered for keyword in category_add_keywords):
+        intent = "add_category"
+    elif any(keyword in lowered for keyword in category_delete_keywords):
+        intent = "delete_category"
+    elif any(keyword in lowered for keyword in category_rename_keywords):
+        intent = "rename_category"
     elif "tabungan" in lowered and any(word in lowered for word in ["buat", "bikin", "baru"]):
         intent = "create_saving"
     elif "setor" in lowered:
