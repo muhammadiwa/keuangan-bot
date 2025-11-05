@@ -3,7 +3,7 @@ services:
     build: ./services/wa-bot-service
     command: ["npm", "run", "start"]
     env_file:
-      - services/wa-bot-service/.env.example
+      - services/wa-bot-service/.env
     ports:
       - "3000:3000"
     volumes:
@@ -16,7 +16,7 @@ services:
     build: ./services/backend-api
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     env_file:
-      - services/backend-api/.env.example
+      - services/backend-api/.env
     ports:
       - "8000:8000"
     depends_on:
@@ -28,7 +28,7 @@ services:
     build: ./services/ai-media-service
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8500"]
     env_file:
-      - services/ai-media-service/.env.example
+      - services/ai-media-service/.env
     ports:
       - "8500:8500"
     depends_on:

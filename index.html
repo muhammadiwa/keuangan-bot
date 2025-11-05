@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <title>Slip BRI Clone</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root {
+      --blue: #0f78cb;
+      --blue-dark: #0d6ab6;
+      --text: #0f172a;
+      --muted: #6b7280;
+      --bg: #f0f2f1;
+      --border: #e5e7eb;
+    }
+
+    * { box-sizing:border-box; }
+
+    body {
+      margin:0;
+      background:var(--bg);
+      font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,sans-serif;
+      display:flex;
+      justify-content:center;
+      padding:10px 0 30px;
+    }
+
+    /* layar */
+    .screen {
+      width:495px;
+      background:var(--bg);
+      overflow:hidden;
+      position:relative;
+    }
+
+    /* ================== HEADER BIRU =================== */
+    .header {
+      position:relative;
+      height:420px; /* tinggi ditambah sampai bagian tengah sumber dana */
+      background:var(--blue);
+      overflow:hidden;
+      border-radius: 0 0 35px 35px;
+    }
+
+    /* shape biru muda yang jatuh dari atas */
+    .header .blob-light {
+      position:absolute;
+      top:-120px;
+      left:-60px;
+      width:420px;
+      height:360px;
+      background:rgba(255,255,255,.12);
+      border-radius:60% 40% 50% 40%;
+      transform:rotate(12deg);
+    }
+
+    /* shape biru agak gelap di kanan bawah */
+    .header .blob-dark {
+      position:absolute;
+      right:-130px;
+      bottom:-90px;
+      width:420px;
+      height:240px;
+      background:rgba(5,85,150,.35);
+      border-radius:50% 60% 0 60%;
+      transform:rotate(-6deg);
+    }
+
+    /* garis lengkung putih */
+    .header .curve-line {
+      position:absolute;
+      top:-70px;
+      left:140px;
+      width:520px;
+      height:360px;
+      border:1.4px solid rgba(255,255,255,.55);
+      border-radius:9999px;
+      transform:rotate(16deg);
+    }
+
+    /* icon centang */
+    .check-wrap {
+      position:absolute;
+      top:40px;
+      left:50%;
+      transform:translateX(-50%);
+      width:116px;
+      height:116px;
+      border-radius:50%;
+      background:rgba(241,250,255,.35);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+    }
+    .check-inner {
+      width:92px;
+      height:92px;
+      background:#fff;
+      border-radius:50%;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+    }
+    .check-inner svg {
+      width:44px;
+      height:44px;
+      stroke:var(--blue);
+      stroke-width:5;
+      fill:none;
+      stroke-linecap:round;
+      stroke-linejoin:round;
+    }
+
+    /* teks status */
+    .header-title {
+      position:relative;
+      width:100%;
+      text-align:center;
+      font-weight:700;
+      font-size:28px;
+      color:#fff;
+      letter-spacing:-.01em;
+      margin-top:160px;
+    }
+    .header-sub {
+      position:relative;
+      width:100%;
+      text-align:center;
+      color:#fff;
+      font-size:15px;
+      margin-top:10px;
+    }
+
+    /* ================== KARTU PUTIH =================== */
+    .receipt {
+      position:relative;
+      margin-top:-180px; /* disesuaikan dengan tinggi header yang baru */
+      margin-left:25px;
+      margin-right:25px;
+      background:#fff;
+      border-radius:26px 26px 0 0;
+      border:1px solid rgba(255,255,255,.3);
+      box-shadow:0 8px 18px rgba(39,95,133,.05);
+      padding:22px 24px 130px;
+      /* watermark "BRI" miring */
+      background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160' viewBox='0 0 160 160'%3E%3Ctext x='0' y='90' transform='rotate(-35 40 40)' fill='%2300437a' font-size='44' font-weight='700' opacity='0.035' font-family='-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Ubuntu,sans-serif'%3EBRI%3C/text%3E%3C/svg%3E");
+      background-size:120px 120px;
+      background-repeat: repeat;
+    }
+
+    /* kuping kiri-kanan (mid) */
+    .receipt::before,
+    .receipt::after {
+      display: none;
+    }
+
+    /* scallop bawah (gigi-gigi) */
+    .receipt-bottom {
+      position:absolute;
+      left:25px;
+      right:25px;
+      bottom:145px;
+      height:22px;
+      background:
+        radial-gradient(circle at 11px -1px, #fff 11px, rgba(255,255,255,0) 11.5px) repeat-x;
+      background-size:32px 22px;
+      z-index:2;
+    }
+
+    /* batas putih -> abu */
+    .receipt-shadowline {
+      position:absolute;
+      left:0;
+      right:0;
+      bottom:110px;
+      height:1px;
+      background:rgba(0,0,0,.03);
+      z-index:1;
+    }
+
+    /* isi kartu */
+    .top-label {
+      text-align:center;
+      font-size:17px;
+      color:#777;
+      margin-bottom:4px;
+    }
+    .amount {
+      text-align:center;
+      font-size:34px;
+      font-weight:700;
+      color:#0b5796;
+      margin-bottom:16px;
+    }
+
+    .ref-row {
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-end;
+      padding-bottom:16px;
+      border-bottom:1px solid rgba(227,231,236,.9);
+      margin-bottom:16px;
+    }
+    .ref-row .label {
+      font-size:15px;
+      color:#4b5563;
+    }
+    .ref-row .value {
+      font-size:16px;
+      font-weight:500;
+      color:#111827;
+      letter-spacing:.01em;
+    }
+
+    /* box sumber dana & tujuan */
+    .party-box {
+      border:1px solid rgba(231,235,238,.9);
+      border-radius:20px;
+      background:rgba(255,255,255,.65);
+      overflow:hidden;
+      margin-bottom:16px;
+      padding: 0 16px;
+    }
+    .party-section {
+      display:flex;
+      padding:16px 0 14px;
+      gap:14px;
+      align-items:flex-start;
+    }
+    .party-section + .party-section {
+      border-top:1px solid rgba(231,235,238,.9);
+    }
+    .party-title {
+      font-weight:700;
+      font-size:17px;
+      color:#3b3b3b;
+      margin-bottom:8px;
+    }
+    .avatar {
+      width:66px;
+      height:66px;
+      border-radius:999px;
+      background:var(--blue);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      color:#fff;
+      font-weight:700;
+      font-size:19px;
+      flex-shrink:0;
+    }
+    .avatar.light {
+      background:#f2f4f5;
+      color:var(--blue);
+      border:1.5px solid rgba(15,120,203,.1);
+    }
+    .party-body .name {
+      font-size:19px;
+      font-weight:700;
+      color:#0f172a;
+      line-height:1.05;
+      margin-bottom:4px;
+    }
+    .party-body .bank {
+      font-size:14px;
+      color:#6b7280;
+      margin-bottom:3px;
+    }
+    .party-body .acc {
+      font-size:14px;
+      color:#6b7280;
+    }
+
+    /* rows detail */
+    .detail-row {
+      display:flex;
+      justify-content:space-between;
+      padding:7px 0;
+      font-size:15px;
+    }
+    .detail-row .left {
+      color:#4b5563;
+    }
+    .detail-row .right {
+      color:#111827;
+      font-weight:600;
+    }
+
+    .divider {
+      height:1px;
+      background:#e5e7eb;
+      margin:14px 0 10px;
+    }
+
+    /* informasi bawah */
+    .info-title {
+      font-weight:700;
+      font-size:14px;
+      margin-bottom:5px;
+      color:#374151;
+    }
+    .info-text {
+      font-size:13.5px;
+      line-height:1.32;
+      color:#6b7280;
+    }
+
+    /* footer (di luar kartu) */
+    .footer {
+      margin-top:120px;
+      text-align:center;
+      font-size:14px;
+      color:#374151;
+    }
+    .footer small {
+      display:block;
+      font-size:14px;
+      color:#9ca3af;
+      margin-top:4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="screen">
+    <!-- HEADER -->
+    <div class="header">
+      <div class="blob-light"></div>
+      <div class="blob-dark"></div>
+      <div class="curve-line"></div>
+
+      <div class="check-wrap">
+        <div class="check-inner">
+          <svg viewBox="0 0 24 24">
+            <path d="M20 6 9 17l-5-5"></path>
+          </svg>
+        </div>
+      </div>
+
+      <div class="header-title">Transaksi Berhasil</div>
+      <div class="header-sub">31 Oktober 2025, 19:57 WIB</div>
+    </div>
+
+    <!-- KARTU -->
+    <div class="receipt">
+      <div class="top-label">Total Transaksi</div>
+      <div class="amount">Rp2.005.000</div>
+
+      <div class="ref-row">
+        <div class="label">No. Ref</div>
+        <div class="value">924543539382</div>
+      </div>
+
+      <div class="party-box">
+        <div class="party-section">
+          <div>
+            <div class="party-title">Sumber Dana</div>
+            <div style="display:flex;gap:14px;">
+              <div class="avatar">MI</div>
+              <div class="party-body">
+                <div class="name">MUHAMMAD IWA</div>
+                <div class="bank">BANK BRI</div>
+                <div class="acc">0523 **** **** 531</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="party-section">
+          <div>
+            <div class="party-title">Tujuan</div>
+            <div style="display:flex;gap:14px;">
+              <div class="avatar light">IDX</div>
+              <div class="party-body">
+                <div class="name">KKI-INDODAX MUHAMMAD IWA</div>
+                <div class="bank">PT Indodax Nasional Indonesia</div>
+                <div class="acc">15884827203175314</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="detail-row">
+        <div class="left">Jenis Transaksi</div>
+        <div class="right">Transfer BRIVA</div>
+      </div>
+      <div class="detail-row">
+        <div class="left">Catatan</div>
+        <div class="right">-</div>
+      </div>
+      <div class="detail-row">
+        <div class="left">Alias Penerima</div>
+        <div class="right">-</div>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="detail-row">
+        <div class="left">Nominal</div>
+        <div class="right">Rp2.005.000</div>
+      </div>
+      <!-- <div class="detail-row">
+        <div class="left">Biaya Admin</div>
+        <div class="right">Rp2.500</div>
+      </div> -->
+
+      <div class="divider"></div>
+
+      <div class="info-title">INFORMASI:</div>
+      <div class="info-text">
+        Biaya Termasuk PPN (Apabila Dikenakan/Apabila Ada)<br>
+        PT. Bank Rakyat Indonesia (Persero) Tbk.<br>
+        Kantor Pusat BRI – Jakarta Pusat<br>
+        NPWP : 01.001.608.7-093.000
+      </div>
+    </div>
+
+    <!-- scallop -->
+    <div class="receipt-bottom"></div>
+    <div class="receipt-shadowline"></div>
+
+    <!-- footer -->
+    <div class="footer">
+      © 2023 PT. Bank Rakyat Indonesia (Persero), Tbk.
+      <small>Terdaftar dan diawasi oleh Otoritas Jasa Keuangan</small>
+    </div>
+  </div>
+</body>
+</html>
