@@ -16,6 +16,7 @@ import { Upload } from '@aws-sdk/lib-storage';
 import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
+import qrcode from 'qrcode-terminal';
 
 dotenv.config();
 
@@ -23,6 +24,13 @@ const app = express();
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 const PORT = process.env.PORT || 3000;
 const BACKEND_API_URL = process.env.BACKEND_API_URL || 'http://localhost:8000';
+const BACKEND_TIMEOUT_MS = (() => {
+  const parsed = Number(process.env.BACKEND_TIMEOUT_MS);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return parsed;
+  }
+  return 60000;
+})();
 const SESSION_ID = process.env.SESSION_ID || 'default';
 const MEDIA_BUCKET = process.env.MEDIA_BUCKET || 'wa-media';
 const MINIO_ENDPOINT = process.env.MINIO_ENDPOINT || 'http://localhost:9000';
@@ -100,7 +108,9 @@ app.post('/webhook/test', async (req, res) => {
 
 const forwardToBackend = async (payload) => {
   try {
-    const { data } = await axios.post(`${BACKEND_API_URL}/wa/incoming`, payload, { timeout: 10000 });
+    const { data } = await axios.post(`${BACKEND_API_URL}/wa/incoming`, payload, {
+      timeout: BACKEND_TIMEOUT_MS,
+    });
     const reply = data?.reply;
     if (reply) {
       const sessionEntry = sessions.get(SESSION_ID);
@@ -116,7 +126,14 @@ const forwardToBackend = async (payload) => {
       }
     }
   } catch (error) {
-    logger.error({ err: error, payload }, 'Failed forwarding to backend');
+    if (axios.isAxiosError(error) && error.code === 'ECONNABORTED') {
+      logger.error(
+        { err: error, payload, timeoutMs: BACKEND_TIMEOUT_MS },
+        'Backend request timed out before completing'
+      );
+    } else {
+      logger.error({ err: error, payload }, 'Failed forwarding to backend');
+    }
   }
 };
 
@@ -214,7 +231,12 @@ const startSession = async (sessionId) => {
   socket.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
+      const cachedQr = qrCache.get(sessionId);
       qrCache.set(sessionId, qr);
+      if (cachedQr !== qr) {
+        logger.info({ sessionId }, 'WhatsApp QR code generated, scan the code below');
+        qrcode.generate(qr, { small: true });
+      }
     }
     if (connection === 'close') {
       const shouldReconnect = (lastDisconnect?.error instanceof Boom && lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut);
