@@ -254,17 +254,8 @@ async def _extract_text_from_payload(payload: IncomingMessage) -> str:
 
     if payload.message_type == "image":
         ocr_response = await _call_ai_service("/media/ocr", {"media_url": payload.media_url})
-        formatted = []
-        if ocr_response.get("merchant"):
-            formatted.append(f"merchant {ocr_response['merchant']}")
-        if ocr_response.get("total"):
-            formatted.append(f"total {ocr_response['total']}")
-        if ocr_response.get("date"):
-            formatted.append(f"tanggal {ocr_response['date']}")
-        raw_text = ocr_response.get("raw_text")
-        if raw_text:
-            formatted.append(raw_text)
-        return " ".join(formatted)
+        formatted = _format_ocr_response(ocr_response)
+        return formatted
 
     return payload.text or ""
 
@@ -1613,6 +1604,83 @@ async def _call_ai_service(endpoint: str, payload: dict[str, object]) -> dict[st
         response = await client.post(url, json=payload)
         response.raise_for_status()
         return response.json()
+
+
+def _format_ocr_response(ocr_response: dict[str, object]) -> str:
+    """Format OCR response menjadi text yang bisa di-parse oleh NLU.
+    
+    Enhanced untuk handle response dari OCR processor yang lebih lengkap.
+    """
+    parts = []
+    
+    # Merchant info
+    merchant = ocr_response.get("merchant")
+    if merchant:
+        parts.append(f"struk dari {merchant}")
+    
+    receipt_type = ocr_response.get("receipt_type")
+    if receipt_type and receipt_type != "unknown":
+        parts.append(f"tipe {receipt_type}")
+    
+    # Amount info - prioritas: total > subtotal
+    total = ocr_response.get("total")
+    if total:
+        parts.append(f"total {total}")
+    else:
+        subtotal = ocr_response.get("subtotal")
+        if subtotal:
+            parts.append(f"subtotal {subtotal}")
+    
+    # Tax & discount
+    tax = ocr_response.get("tax")
+    if tax:
+        parts.append(f"pajak {tax}")
+    
+    discount = ocr_response.get("discount")
+    if discount:
+        parts.append(f"diskon {discount}")
+    
+    # Date & time
+    date = ocr_response.get("date")
+    if date:
+        parts.append(f"tanggal {date}")
+    
+    time = ocr_response.get("time")
+    if time:
+        parts.append(f"jam {time}")
+    
+    # Payment method
+    payment = ocr_response.get("payment_method")
+    if payment:
+        parts.append(f"bayar {payment}")
+    
+    # Items summary (if available)
+    items = ocr_response.get("items")
+    if items and isinstance(items, list) and len(items) > 0:
+        item_names = [item.get("name", "") for item in items[:3] if item.get("name")]
+        if item_names:
+            parts.append(f"item: {', '.join(item_names)}")
+    
+    # Confidence info for logging
+    confidence = ocr_response.get("confidence", 0)
+    if confidence and confidence < 0.5:
+        logger.warning(
+            "Low OCR confidence",
+            confidence=confidence,
+            merchant=merchant,
+            total=total,
+        )
+    
+    # Fallback to raw_text if no structured data
+    if not parts:
+        raw_text = ocr_response.get("raw_text", "")
+        if raw_text:
+            # Clean up raw text - take first 500 chars
+            cleaned = " ".join(raw_text.split())[:500]
+            return cleaned
+        return ""
+    
+    return " ".join(parts)
 
 
 def _heuristic_parse(text: str) -> ParsedIntent:

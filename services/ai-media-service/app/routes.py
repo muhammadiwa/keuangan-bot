@@ -57,9 +57,19 @@ class STTResponse(BaseModel):
 
 class OCRResponse(BaseModel):
     total: float | None = None
+    subtotal: float | None = None
+    tax: float | None = None
+    discount: float | None = None
     date: str | None = None
+    time: str | None = None
     merchant: str | None = None
+    merchant_address: str | None = None
+    receipt_type: str | None = None
+    items: list[dict] | None = None
+    payment_method: str | None = None
     raw_text: str | None = None
+    confidence: float | None = None
+    preprocessing_applied: list[str] | None = None
 
 
 @router.post("/ai/parse", response_model=ParseResponse)
@@ -90,8 +100,31 @@ async def media_ocr(body: MediaUrlRequest) -> OCRResponse:
     if not body.media_url:
         raise HTTPException(status_code=400, detail="media_url is required")
     image_bytes = await _download_media(body.media_url)
-    result = await _run_ocr(image_bytes)
-    return OCRResponse(**result)
+    
+    # Use enhanced OCR processor
+    from app.ocr_processor import get_ocr_processor
+    
+    loop = asyncio.get_running_loop()
+    
+    def _process_ocr() -> dict:
+        processor = get_ocr_processor(settings.tesseract_lang)
+        result = processor.process_image(image_bytes)
+        return result.to_dict()
+    
+    try:
+        result = await loop.run_in_executor(None, _process_ocr)
+        logger.info(
+            "OCR completed",
+            merchant=result.get("merchant"),
+            total=result.get("total"),
+            confidence=result.get("confidence"),
+        )
+        return OCRResponse(**result)
+    except Exception as e:
+        logger.exception(f"OCR processing failed: {e}")
+        # Fallback to legacy OCR
+        result = await _run_ocr_legacy(image_bytes)
+        return OCRResponse(**result)
 
 
 @router.get("/healthz", response_model=dict)
@@ -523,7 +556,8 @@ async def _transcribe_audio(audio_bytes: bytes) -> str:
     return transcript or "(tidak ada transkrip)"
 
 
-async def _run_ocr(image_bytes: bytes) -> dict[str, Any]:
+async def _run_ocr_legacy(image_bytes: bytes) -> dict[str, Any]:
+    """Legacy OCR fallback jika enhanced processor gagal"""
     if pytesseract is None or Image is None:  # pragma: no cover
         logger.warning("OCR dependencies missing, returning empty result")
         return {"total": None, "date": None, "merchant": None, "raw_text": None}
@@ -537,14 +571,15 @@ async def _run_ocr(image_bytes: bytes) -> dict[str, Any]:
     def _run() -> dict[str, Any]:
         image = Image.open(tmp_path)
         text = pytesseract.image_to_string(image, lang=settings.tesseract_lang)
-        merchant = _extract_merchant(text)
-        total = _extract_total(text)
-        ocr_date = _extract_date(text)
+        merchant = _extract_merchant_legacy(text)
+        total = _extract_total_legacy(text)
+        ocr_date = _extract_date_legacy(text)
         return {
             "total": total,
             "date": ocr_date,
             "merchant": merchant,
             "raw_text": text,
+            "confidence": 0.3,  # Low confidence for legacy
         }
 
     try:
@@ -558,40 +593,86 @@ async def _run_ocr(image_bytes: bytes) -> dict[str, Any]:
     return result
 
 
-def _extract_total(text: str) -> float | None:
-    pattern = re.compile(r"total\s*[:=]?\s*([0-9.,]+)", re.IGNORECASE)
-    match = pattern.search(text)
-    if not match:
-        match = re.search(r"([0-9][0-9.,]{4,})", text)
-    if not match:
-        return None
-    value = match.group(1).replace(".", "").replace(",", ".")
-    try:
-        return float(value)
-    except ValueError:  # pragma: no cover
-        return None
-
-
-def _extract_date(text: str) -> str | None:
+def _extract_total_legacy(text: str) -> float | None:
+    """Legacy total extraction"""
+    # Try explicit total patterns first
     patterns = [
-        r"(\d{4}-\d{2}-\d{2})",
-        r"(\d{2}/\d{2}/\d{4})",
-        r"(\d{2}-\d{2}-\d{4})",
+        r"(?:grand\s*)?total\s*[:\s]*[Rr]?[Pp]?\.?\s*([0-9][0-9.,]*)",
+        r"(?:bayar|tunai|cash)\s*[:\s]*[Rr]?[Pp]?\.?\s*([0-9][0-9.,]*)",
     ]
     for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            value = match.group(1).replace(".", "").replace(",", ".")
+            try:
+                amount = float(value)
+                if amount > 100:
+                    return amount
+            except ValueError:
+                continue
+    
+    # Fallback: find largest number
+    matches = re.findall(r"([0-9][0-9.,]{4,})", text)
+    amounts = []
+    for m in matches:
+        try:
+            val = float(m.replace(".", "").replace(",", "."))
+            if val > 100:
+                amounts.append(val)
+        except ValueError:
+            continue
+    
+    return max(amounts) if amounts else None
+
+
+def _extract_date_legacy(text: str) -> str | None:
+    """Legacy date extraction dengan support format Indonesia"""
+    patterns = [
+        (r"(\d{4})-(\d{2})-(\d{2})", "ymd"),
+        (r"(\d{2})/(\d{2})/(\d{4})", "dmy"),
+        (r"(\d{2})-(\d{2})-(\d{4})", "dmy"),
+        (r"(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})", "dmy"),
+    ]
+    for pattern, fmt in patterns:
         match = re.search(pattern, text)
         if match:
-            raw = match.group(1)
             try:
-                dt = datetime.fromisoformat(raw.replace("/", "-") if "/" in raw else raw)
-                return dt.date().isoformat()
-            except ValueError:
+                groups = match.groups()
+                if fmt == "ymd":
+                    year, month, day = int(groups[0]), int(groups[1]), int(groups[2])
+                else:
+                    day, month, year = int(groups[0]), int(groups[1]), int(groups[2])
+                    if year < 100:
+                        year += 2000
+                
+                if 1 <= day <= 31 and 1 <= month <= 12 and 2000 <= year <= 2100:
+                    return f"{year:04d}-{month:02d}-{day:02d}"
+            except (ValueError, IndexError):
                 continue
     return None
 
 
-def _extract_merchant(text: str) -> str | None:
+def _extract_merchant_legacy(text: str) -> str | None:
+    """Legacy merchant extraction dengan keyword detection"""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if lines:
-        return lines[0][:64]
-    return None
+    if not lines:
+        return None
+    
+    # Known merchants
+    known_merchants = [
+        "indomaret", "alfamart", "alfamidi", "hypermart", "carrefour",
+        "giant", "superindo", "mcd", "mcdonald", "kfc", "starbucks",
+        "kopi kenangan", "janji jiwa"
+    ]
+    
+    text_lower = text.lower()
+    for merchant in known_merchants:
+        if merchant in text_lower:
+            return merchant.title()
+    
+    # Fallback: first non-numeric line
+    for line in lines[:3]:
+        if not re.match(r'^[\d\s/\-:.,]+$', line) and len(line) > 2:
+            return line[:64]
+    
+    return lines[0][:64]
