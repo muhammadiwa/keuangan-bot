@@ -8,6 +8,8 @@ services:
       - "3000:3000"
     volumes:
       - ./services/wa-bot-service/sessions:/app/sessions
+      # Local storage volume (used when STORAGE_TYPE=local)
+      - ./data/media:/app/data/media
     depends_on:
       - backend-api
     restart: unless-stopped

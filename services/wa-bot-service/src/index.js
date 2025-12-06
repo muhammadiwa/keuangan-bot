@@ -11,12 +11,13 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import NodeCache from 'node-cache';
 import { Boom } from '@hapi/boom';
-import { S3Client, HeadBucketCommand, CreateBucketCommand } from '@aws-sdk/client-s3';
-import { Upload } from '@aws-sdk/lib-storage';
 import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
 import qrcode from 'qrcode-terminal';
+
+// Storage abstraction
+import { createStorage, getStorageConfig } from './storage/index.js';
 
 dotenv.config();
 
@@ -32,47 +33,52 @@ const BACKEND_TIMEOUT_MS = (() => {
   return 60000;
 })();
 const SESSION_ID = process.env.SESSION_ID || 'default';
-const MEDIA_BUCKET = process.env.MEDIA_BUCKET || 'wa-media';
-const MINIO_ENDPOINT = process.env.MINIO_ENDPOINT || 'http://localhost:9000';
-const MINIO_REGION = process.env.MINIO_REGION || 'us-east-1';
-const MINIO_ACCESS_KEY = process.env.MINIO_ACCESS_KEY || 'minio';
-const MINIO_SECRET_KEY = process.env.MINIO_SECRET_KEY || 'miniopass';
-const MINIO_PUBLIC_URL = process.env.MINIO_PUBLIC_URL || `${MINIO_ENDPOINT}/${MEDIA_BUCKET}`;
 
 app.use(express.json({ limit: '10mb' }));
 
 const sessions = new Map();
 const qrCache = new NodeCache({ stdTTL: 120 });
 
-const s3Client = new S3Client({
-  forcePathStyle: true,
-  endpoint: MINIO_ENDPOINT,
-  region: MINIO_REGION,
-  credentials: {
-    accessKeyId: MINIO_ACCESS_KEY,
-    secretAccessKey: MINIO_SECRET_KEY,
-  },
-});
+// Initialize storage based on configuration
+const storageConfig = getStorageConfig();
+const storage = createStorage(storageConfig, logger);
 
-const ensureBucket = async () => {
-  try {
-    await s3Client.send(new HeadBucketCommand({ Bucket: MEDIA_BUCKET }));
-  } catch (error) {
-    if (error?.$metadata?.httpStatusCode === 404 || error?.name === 'NotFound') {
-      try {
-        await s3Client.send(new CreateBucketCommand({ Bucket: MEDIA_BUCKET }));
-        logger.info({ bucket: MEDIA_BUCKET }, 'Created media bucket');
-      } catch (createErr) {
-        logger.error({ err: createErr }, 'Failed to create bucket');
-      }
-    } else {
-      logger.warn({ err: error }, 'Bucket check failed');
+// Serve local media files if using local storage
+if (storageConfig.type === 'local') {
+  const localBasePath = path.resolve(storageConfig.local.basePath);
+
+  app.get('/media/*', (req, res) => {
+    const relativePath = req.params[0];
+    const filePath = path.join(localBasePath, relativePath);
+
+    // Security: prevent directory traversal
+    if (!filePath.startsWith(localBasePath)) {
+      return res.status(403).json({ message: 'Forbidden' });
     }
-  }
-};
+
+    // Check if file exists
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ message: 'File not found' });
+    }
+
+    // Get content type
+    const contentType = storage.getContentType(filePath);
+    res.setHeader('Content-Type', contentType);
+
+    // Stream file
+    const stream = fs.createReadStream(filePath);
+    stream.pipe(res);
+  });
+
+  logger.info({ basePath: localBasePath }, 'Local media serving enabled at /media/*');
+}
 
 app.get('/healthz', (_, res) => {
-  res.json({ status: 'ok', session: Array.from(sessions.keys()) });
+  res.json({
+    status: 'ok',
+    session: Array.from(sessions.keys()),
+    storage: storage.getType(),
+  });
 });
 
 app.get('/session/:id/qr', (req, res) => {
@@ -106,6 +112,16 @@ app.post('/webhook/test', async (req, res) => {
   res.json({ status: 'ok' });
 });
 
+// Storage info endpoint
+app.get('/storage/info', (_, res) => {
+  res.json({
+    type: storage.getType(),
+    config: storageConfig.type === 'local'
+      ? { basePath: storageConfig.local.basePath, baseUrl: storageConfig.local.baseUrl }
+      : { endpoint: storageConfig.minio.endpoint, bucket: storageConfig.minio.bucket },
+  });
+});
+
 const forwardToBackend = async (payload) => {
   try {
     const { data } = await axios.post(`${BACKEND_API_URL}/wa/incoming`, payload, {
@@ -137,20 +153,14 @@ const forwardToBackend = async (payload) => {
   }
 };
 
-const storeMedia = async (stream, { folder, contentType }) => {
-  const timestamp = new Date().toISOString().replace(/[:]/g, '-');
-  const fileName = `${folder}/${timestamp}-${crypto.randomUUID()}`;
-  const upload = new Upload({
-    client: s3Client,
-    params: {
-      Bucket: MEDIA_BUCKET,
-      Key: fileName,
-      Body: stream,
-      ContentType: contentType,
-    },
-  });
-  await upload.done();
-  return `${MINIO_PUBLIC_URL}/${fileName}`;
+/**
+ * Store media using configured storage backend
+ * @param {Buffer} buffer - Media buffer
+ * @param {Object} options - Store options
+ * @returns {Promise<string>} Media URL
+ */
+const storeMedia = async (buffer, { folder, contentType }) => {
+  return storage.store(buffer, { folder, contentType });
 };
 
 const normalizeMessage = async (message) => {
@@ -203,6 +213,24 @@ const normalizeMessage = async (message) => {
       from_number: fromNumber,
       message_type: 'image',
       text: content.imageMessage.caption || null,
+      media_url: mediaUrl,
+      timestamp,
+    };
+  }
+
+  if (content.documentMessage) {
+    const stream = await downloadContentFromMessage(content.documentMessage, 'document');
+    const bufferArray = [];
+    for await (const chunk of stream) {
+      bufferArray.push(chunk);
+    }
+    const mediaBuffer = Buffer.concat(bufferArray);
+    const mimeType = content.documentMessage.mimetype || 'application/octet-stream';
+    const mediaUrl = await storeMedia(mediaBuffer, { folder: 'documents', contentType: mimeType });
+    return {
+      from_number: fromNumber,
+      message_type: 'document',
+      text: content.documentMessage.caption || content.documentMessage.fileName || null,
       media_url: mediaUrl,
       timestamp,
     };
@@ -271,9 +299,24 @@ const startSession = async (sessionId) => {
   sessions.set(sessionId, { socket });
 };
 
-ensureBucket().catch((err) => logger.error({ err }, 'Failed ensuring media bucket'));
-startSession(SESSION_ID).catch((err) => logger.error({ err }, 'Failed to start session'));
+// Initialize storage and start application
+const initialize = async () => {
+  try {
+    // Initialize storage
+    await storage.initialize();
+    logger.info({ storageType: storage.getType() }, 'Storage initialized successfully');
 
-app.listen(PORT, () => {
-  logger.info(`wa-bot-service listening on port ${PORT}`);
-});
+    // Start WhatsApp session
+    await startSession(SESSION_ID);
+
+    // Start HTTP server
+    app.listen(PORT, () => {
+      logger.info({ port: PORT, storageType: storage.getType() }, 'wa-bot-service started');
+    });
+  } catch (error) {
+    logger.error({ err: error }, 'Failed to initialize application');
+    process.exit(1);
+  }
+};
+
+initialize();
