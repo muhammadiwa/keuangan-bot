@@ -1,16 +1,68 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.eggs/
+*.egg-info/
+*.egg
+
+# Environment files
 .env
 .env.*
 !.env.example
 !*/.env.example
+
+# Node.js
 node_modules/
+
+# Service-specific env files
 services/wa-bot-service/.env.local
 services/backend-api/.env
 services/ai-media-service/.env
+
+# IDE
 .idea/
 .vscode/
+*.swp
+*.swo
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Data directories
 .data/
 data/
+
+# WhatsApp sessions
 services/wa-bot-service/sessions/
+
+# Testing
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Build artifacts
+dist/
+build/
+*.manifest
+*.spec
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+.tmp/
+tmp/
+
+# Kiro
+.kiro/

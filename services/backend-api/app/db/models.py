@@ -169,10 +169,15 @@ class AIAudit(Base):
     user_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), index=True
     )
+    provider: Mapped[str | None] = mapped_column(String(64))
     model_name: Mapped[str | None] = mapped_column(String(120))
     raw_input: Mapped[str | None] = mapped_column(Text)
     raw_output: Mapped[str | None] = mapped_column(Text)
     success: Mapped[bool] = mapped_column(Boolean, default=True)
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    estimated_cost: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    latency_ms: Mapped[float | None] = mapped_column(Float)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=datetime.utcnow, nullable=False, index=True
     )

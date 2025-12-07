@@ -7,3 +7,7 @@ faster-whisper==1.0.1
 pytesseract==0.3.10
 Pillow==10.2.0
 numpy==1.26.4
+
+# Testing
+pytest==8.0.0
+hypothesis==6.100.0

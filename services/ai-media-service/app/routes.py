@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -5,7 +7,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any
+from typing import Any, Optional, TYPE_CHECKING
 
 import httpx
 from fastapi import APIRouter, HTTPException
@@ -13,11 +15,9 @@ from loguru import logger
 from pydantic import BaseModel
 
 from app.config import get_settings
-
-try:  # pragma: no cover - optional dependencies for heavy workloads
-    from faster_whisper import WhisperModel
-except ImportError:  # pragma: no cover
-    WhisperModel = None  # type: ignore
+from app.providers.manager import AIProviderManager
+from app.providers.base import ProviderError
+from app.providers.stt import STTProviderManager, STTProviderError
 
 try:  # pragma: no cover
     from PIL import Image
@@ -29,7 +29,24 @@ except ImportError:  # pragma: no cover
 
 router = APIRouter()
 settings = get_settings()
-_whisper_model: WhisperModel | None = None
+_ai_provider_manager: Optional[AIProviderManager] = None
+_stt_provider_manager: Optional[STTProviderManager] = None
+
+
+def get_ai_provider_manager() -> AIProviderManager:
+    """Get or create the AI Provider Manager singleton."""
+    global _ai_provider_manager
+    if _ai_provider_manager is None:
+        _ai_provider_manager = AIProviderManager(settings)
+    return _ai_provider_manager
+
+
+def get_stt_provider_manager() -> STTProviderManager:
+    """Get or create the STT Provider Manager singleton."""
+    global _stt_provider_manager
+    if _stt_provider_manager is None:
+        _stt_provider_manager = STTProviderManager(settings)
+    return _stt_provider_manager
 
 
 class ParseRequest(BaseModel):
@@ -74,13 +91,55 @@ class OCRResponse(BaseModel):
 
 @router.post("/ai/parse", response_model=ParseResponse)
 async def parse_text(body: ParseRequest) -> ParseResponse:
-    prompt = _build_nlu_prompt(body.text)
-    logger.debug("Sending prompt to Ollama", prompt=prompt)
+    """
+    Parse text using AI provider with automatic fallback.
+    
+    Uses the configured AI provider (via AIProviderManager) to parse
+    natural language input. Falls back to heuristic parsing if all
+    AI providers fail.
+    """
+    manager = get_ai_provider_manager()
+    messages = [
+        {"role": "system", "content": _get_nlu_system_prompt()},
+        {"role": "user", "content": body.text},
+    ]
+    
+    logger.debug(
+        "Sending NLU request",
+        provider=settings.ai_provider,
+        text_length=len(body.text),
+    )
+    
     try:
-        result = await _call_ollama(prompt)
-        payload = _extract_json_payload(result)
-    except Exception as exc:  # pragma: no cover - fallback path
-        logger.warning("Ollama parse failed, using heuristics", error=str(exc))
+        # Try AI providers with heuristic fallback
+        ai_response, heuristic_result = await manager.chat_completion_with_heuristic_fallback(
+            messages=messages,
+            heuristic_fn=_heuristic_payload,
+            temperature=0.3,  # Lower temperature for more consistent parsing
+            max_tokens=500,
+        )
+        
+        if ai_response:
+            # AI provider succeeded
+            payload = _extract_json_payload(ai_response.content)
+            logger.info(
+                "AI parse succeeded",
+                provider=ai_response.provider,
+                model=ai_response.model,
+                latency_ms=ai_response.latency_ms,
+            )
+        else:
+            # Heuristic fallback was used
+            payload = heuristic_result
+            logger.info("Using heuristic fallback result")
+            
+    except ProviderError as exc:
+        # All providers and heuristic failed - this shouldn't happen
+        # but handle gracefully
+        logger.error("All parsing methods failed", error=str(exc))
+        payload = _heuristic_payload(body.text)
+    except Exception as exc:  # pragma: no cover - unexpected errors
+        logger.warning("Unexpected error in parse, using heuristics", error=str(exc))
         payload = _heuristic_payload(body.text)
 
     return ParseResponse(**payload)
@@ -88,11 +147,45 @@ async def parse_text(body: ParseRequest) -> ParseResponse:
 
 @router.post("/media/stt", response_model=STTResponse)
 async def media_stt(body: MediaUrlRequest) -> STTResponse:
+    """
+    Transcribe audio to text using the configured STT provider.
+    
+    Supports multiple STT providers:
+    - Local Whisper (faster-whisper)
+    - OpenAI Whisper API
+    - Groq Whisper API (fast transcription)
+    
+    Configure via STT_PROVIDER environment variable.
+    """
     if not body.media_url:
         raise HTTPException(status_code=400, detail="media_url is required")
+    
     audio_bytes = await _download_media(body.media_url)
-    text = await _transcribe_audio(audio_bytes)
-    return STTResponse(text=text)
+    
+    stt_manager = get_stt_provider_manager()
+    
+    try:
+        result = await stt_manager.transcribe(
+            audio_bytes=audio_bytes,
+            language="id",  # Default to Indonesian
+        )
+        
+        logger.info(
+            "STT completed",
+            provider=result.provider,
+            model=result.model,
+            latency_ms=round(result.latency_ms, 2),
+            text_length=len(result.text),
+        )
+        
+        return STTResponse(text=result.text)
+        
+    except STTProviderError as e:
+        logger.error("STT provider error", error=str(e), provider=e.provider)
+        raise HTTPException(
+            status_code=503,
+            detail=f"STT service unavailable: {e}",
+        )
 
 
 @router.post("/media/ocr", response_model=OCRResponse)
@@ -129,8 +222,79 @@ async def media_ocr(body: MediaUrlRequest) -> OCRResponse:
 
 @router.get("/healthz", response_model=dict)
 async def healthz() -> dict:
+    """
+    Health check endpoint with AI and STT provider status.
+    
+    Returns the overall service health including:
+    - AI provider health status (primary and fallback)
+    - STT provider health status
+    - Provider latency metrics
+    - Configuration details
+    """
+    ai_manager = get_ai_provider_manager()
+    stt_manager = get_stt_provider_manager()
+    
+    # Get AI provider health status
+    try:
+        ai_health = await ai_manager.get_health_status()
+    except Exception as e:
+        logger.warning("Failed to get AI provider health", error=str(e))
+        ai_health = {
+            "status": "unknown",
+            "error": str(e),
+            "providers": {},
+        }
+    
+    # Get STT provider health status
+    try:
+        stt_health = await stt_manager.get_health_status()
+    except Exception as e:
+        logger.warning("Failed to get STT provider health", error=str(e))
+        stt_health = {
+            "status": "unknown",
+            "error": str(e),
+        }
+    
+    # Determine overall service status
+    ai_status = ai_health.get("status", "unknown")
+    stt_status = stt_health.get("status", "unknown")
+    
+    if ai_status == "healthy" and stt_status == "healthy":
+        overall_status = "ok"
+    elif ai_status in ("healthy", "degraded") or stt_status in ("healthy", "degraded"):
+        overall_status = "degraded"
+    else:
+        overall_status = "unhealthy"
+    
+    # Get provider info
+    provider_info = ai_manager.get_provider_info()
+    stt_provider_info = stt_manager.get_provider_info()
+    
     return {
-        "status": "ok",
+        "status": overall_status,
+        "ai_providers": {
+            "status": ai_status,
+            "primary": {
+                "provider": settings.ai_provider,
+                "model": settings.get_effective_ai_model(),
+                "available": provider_info.get("primary", {}).get("available", False),
+                "health": ai_health.get("providers", {}).get("primary", {}),
+            },
+            "fallback": {
+                "provider": settings.ai_fallback_provider,
+                "model": settings.ai_fallback_model,
+                "available": provider_info.get("fallback", {}).get("available", False),
+                "health": ai_health.get("providers", {}).get("fallback", {}),
+            } if settings.ai_fallback_provider else None,
+            "summary": ai_health.get("summary", {}),
+        },
+        "stt_provider": {
+            "status": stt_status,
+            "provider": stt_provider_info.get("provider"),
+            "model": stt_provider_info.get("model"),
+            "health": stt_health.get("details", {}),
+        },
+        # Legacy fields for backward compatibility
         "ollama_url": settings.ollama_url,
         "ollama_model": settings.ollama_model,
         "whisper_model": settings.whisper_model,
@@ -139,6 +303,12 @@ async def healthz() -> dict:
 
 
 async def _call_ollama(prompt: str) -> str:
+    """
+    Legacy direct Ollama call (kept for backward compatibility).
+    
+    Note: The main /ai/parse endpoint now uses AIProviderManager.
+    This function is kept for any code that still needs direct Ollama access.
+    """
     async with httpx.AsyncClient(timeout=120.0) as client:
         response = await client.post(
             f"{settings.ollama_url}/api/generate",
@@ -149,10 +319,11 @@ async def _call_ollama(prompt: str) -> str:
         return data.get("response", "")
 
 
-def _build_nlu_prompt(text: str) -> str:
+def _get_nlu_system_prompt() -> str:
+    """Get the system prompt for NLU parsing."""
     return (
         "Kamu adalah agen NLU untuk pencatat keuangan pribadi. "
-        "Analisis pesan berikut dan hasilkan JSON dengan format:\n"
+        "Analisis pesan pengguna dan hasilkan JSON dengan format:\n"
         "{\n"
         '  "intent": "create_transaction | create_saving | deposit_saving | withdraw_saving | get_report | set_budget | smalltalk",\n'
         '  "amount": <angka atau null>,\n'
@@ -162,9 +333,16 @@ def _build_nlu_prompt(text: str) -> str:
         '  "datetime": "ISO8601 atau null",\n'
         '  "confidence": 0-1\n'
         "}\n"
-        "Pesan: "
-        f"""{text}"""
-        "\nBalas hanya JSON valid."
+        "Balas hanya dengan JSON valid, tanpa penjelasan tambahan."
+    )
+
+
+def _build_nlu_prompt(text: str) -> str:
+    """Build NLU prompt for legacy Ollama generate endpoint (kept for backward compatibility)."""
+    return (
+        _get_nlu_system_prompt()
+        + "\n\nPesan: "
+        + text
     )
 
 

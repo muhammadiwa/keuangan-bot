@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import models
 from app.db.session import get_session
+from app.schemas.ai_audit import AIAuditCreate, AIAuditResponse
 from app.schemas.reports import CategoryBreakdown, DailyReportResponse
 from app.schemas.savings import (
     SavingsAccountCreate,
@@ -251,3 +252,45 @@ async def _apply_savings_movement(
         else f"✅ Penarikan Rp{body.amount:,.0f} dari tabungan {account.name}."
     )
     return SavingsTransactionResponse(message=message)
+
+
+# AI Audit endpoints for cost tracking (Requirements: 14.1, 14.2)
+
+@router.post("/api/v1/ai-audit", response_model=AIAuditResponse, status_code=status.HTTP_201_CREATED)
+async def create_ai_audit(
+    body: AIAuditCreate, session: AsyncSession = Depends(get_session)
+) -> AIAuditResponse:
+    """
+    Record AI provider usage for cost tracking.
+    
+    This endpoint is called by ai-media-service after each AI provider call
+    to record token usage, costs, and latency metrics.
+    """
+    audit = models.AIAudit(
+        user_id=body.user_id,
+        provider=body.provider,
+        model_name=body.model_name,
+        raw_input=body.raw_input,
+        raw_output=body.raw_output,
+        success=body.success,
+        input_tokens=body.input_tokens,
+        output_tokens=body.output_tokens,
+        estimated_cost=Decimal(str(body.estimated_cost)) if body.estimated_cost is not None else None,
+        latency_ms=body.latency_ms,
+        extra=body.extra,
+    )
+    session.add(audit)
+    await session.commit()
+    await session.refresh(audit)
+    
+    return AIAuditResponse(
+        id=audit.id,
+        provider=audit.provider,
+        model_name=audit.model_name,
+        input_tokens=audit.input_tokens,
+        output_tokens=audit.output_tokens,
+        estimated_cost=float(audit.estimated_cost) if audit.estimated_cost else None,
+        latency_ms=audit.latency_ms,
+        success=audit.success,
+        created_at=audit.created_at,
+    )

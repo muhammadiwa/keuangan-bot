@@ -11,15 +11,20 @@ Fitur:
 - Item extraction dari struk
 """
 
+from __future__ import annotations
+
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    from PIL import Image as PILImage
 
 try:
     from PIL import Image, ImageEnhance, ImageFilter, ImageOps
